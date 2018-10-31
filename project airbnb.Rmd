@@ -1,0 +1,571 @@
+---
+title: "Project"
+author: "Xinyi He"
+date: "4/13/2018"
+output: word_document
+---
+```{r}
+
+require(ggplot2) # for data visualization
+require(stringr) #extracting string patterns
+require(Matrix) # matrix transformations
+require(glmnet) # ridge, lasso & elastinet
+require(xgboost) # gbm
+require(randomForest)
+require(Metrics) # rmse
+require(dplyr) # load this in last so plyr doens't overlap it
+require(caret) # one hot encoding
+require(scales) # plotting $$
+require(e1071) # skewness
+require(corrplot) # correlation plot
+```
+```{r}
+install.packages("stringr")
+library(stringr)
+```
+
+```{r setup, include=FALSE}
+train<<- read.csv("d:/research/Collaborations/Xinyi/Prj/Prj/airbnb_train_x.csv", stringsAsFactors = FALSE)
+#train<<- read.csv("d:/research/Collaborations/Xinyi/Prj/Prj/airbnb_train_x.csv", stringsAsFactors = TRUE)
+y.labels<<- read.csv("d:/research/Collaborations/Xinyi/Prj/Prj/airbnb_train_y.csv", stringsAsFactors = FALSE)
+y.booking.rates=as.numeric(y.labels[, 3])
+na.cols <- which(colSums(is.na(train)) > 0)
+sort(colSums(sapply(train[na.cols], is.na)),decreasing=TRUE)
+length(na.cols)
+```
+
+
+# Data Processing
+remove smartloaction, weekly price, 
+
+```{r setup, include=FALSE}
+
+
+dollar.to.numeric<-function(prices){
+  price.new=unlist(lapply(prices, function(p){
+    price=0
+    if(!is.na(p) & nchar(p)>0 & substr(p, 1, 1)=="$"){
+      price=round(as.numeric(substr(p, 2, nchar(p))))
+    }
+    price
+  }))
+  price.new[which(is.na(price.new))]=0
+  return(price.new)
+}
+
+
+# price, NAs introduced by coercion
+price.new = dollar.to.numeric(train$price)
+
+#property_type
+table(train$property_type)
+train$property_type[is.na(train$property_type)] <- 'Apartment'
+
+
+# security deposit
+security.deposit.new = dollar.to.numeric(train$security_deposit)
+
+
+zipcode.new=unlist(lapply(train$zipcode, function(z){ 
+  z2=0
+  if(!is.na(z) & nchar(z)>4){
+    z2=as.numeric(substr(z, 1,5))
+  }
+  z2
+  }))
+zipcode.new[which(is.na(zipcode.new))]=0
+
+##missing values
+for (i in 1:nrow(train)){
+        if(is.na(train$latitude[i])){
+               train$latitude[i] <- as.numeric(mean(train$latitude[train$city==train$city[i]], na.rm=TRUE)) 
+        }
+}
+last.14.var.table=cbind(price.new,
+                        factor(train$property_type),
+                        factor(train$require_guest_phone_verification),
+                        factor(train$require_guest_profile_picture),
+                        factor(train$requires_license),
+                        factor(train$room_type),
+                        security.deposit.new,
+                        factor(train$smart_location),
+                        factor(train$state),
+                        zipcode.new)
+
+colnames(last.14.var.table)=c("price","property.type", "phone.verification", "profile.picture", "license", "room.type", "security.deposit", "smart.location", "state", "zipcode")
+
+
+
+##
+
+all.amenities = c()
+for(i in 1:nrow(train)){
+  amenities = train$amenities[i]
+  amenities.new = strsplit(amenities, ",", fixed=TRUE)[[1]]
+  all.amenities = c(all.amenities, unlist(lapply(amenities.new, function(a){x=strsplit(gsub("[^[:alnum:] ]", "", a), " +")[[1]]; paste0(x, collapse = " ")})))
+  
+}
+
+all.amenities.variables = unique(all.amenities)
+all.amenities.variables = all.amenities.variables[which(unlist(lapply(all.amenities.variables, function(a){nchar(a)}))>1)]
+
+a.names=names(table(all.amenities))
+a.values=as.numeric(table(all.amenities))
+
+
+all.amenities.variables = a.names[which(a.values>(i*0.1) & a.values<(i*0.9))]
+
+all.amenities.matrix = matrix(0, nrow(train), length(all.amenities.variables))
+for(j in 1:nrow(train)){
+  amenities = train$amenities[j]
+  amenities.new = strsplit(amenities, ",", fixed=TRUE)[[1]]
+  this.amenities =  unlist(lapply(amenities.new, function(a){x=strsplit(gsub("[^[:alnum:] ]", "", a), " +")[[1]]; paste0(x, collapse = " ")}))
+  all.amenities.dummy=rep(0, length(all.amenities.variables))
+  all.amenities.dummy[which(all.amenities.variables %in% this.amenities)] = 1
+  all.amenities.matrix[j,]=all.amenities.dummy
+}
+
+colnames(all.amenities.matrix) = all.amenities.variables
+
+
+
+
+orig.nums=as.numeric(rownames(varImp(results)))
+
+new.names=rownames(varImp(results))
+for(k in 1:length(orig.nums)){
+  v = orig.nums[k]
+  if(!is.na(v)){
+    new.names[k]=all.amenities.variables[v]
+  }
+  
+}
+
+var.imp = cbind(new.names, varImp(results)[,1])
+colnames(var.imp) = c("variableName", "importance")
+write.table(var.imp, "d:/research/Collaborations/Xinyi/varibleSelection.txt", quote=FALSE, sep=",", col.names = TRUE)
+
+
+
+
+
+
+
+##---------------------------------------------------
+## training phase, feature elimination, model fitting
+##---------------------------------------------------
+
+train.indicies = 1001:2000
+
+last.14.var.table.dataframe = data.frame(last.14.var.table)
+cols = colnames(last.14.var.table.dataframe)[c(2:6, 8:10)]
+last.14.var.table.dataframe[cols] <- lapply(last.14.var.table.dataframe[cols], factor)
+
+col.to.be.removed=c(2, 8, 10)
+y.1k.booking.rates = y.booking.rates[train.indicies]
+a.dataframe = last.14.var.table.dataframe[train.indicies, ]
+
+
+a.dataframe[cols] <- lapply(a.dataframe[cols], factor)
+a.dataframe.2=a.dataframe[, -col.to.be.removed]
+
+
+lg.model = glm(y.1k.booking.rates ~ ., family = binomial(link = "logit"), data = a.dataframe.2)
+
+
+
+
+##---------------------------------------------------
+## training phase, feature elimination, model fitting
+##---------------------------------------------------
+
+train.indicies = sample(nrow(train), 20000) # 70000:80000 # 10000:20000 #  1:6000 # :7000
+
+
+
+selected.cols=c("accommodates", "availability_30","availability_365","availability_60","availability_90", "bathrooms", "bed_type",
+                "bedrooms","beds" , "cancellation_policy","city", "guests_included", "host_has_profile_pic",   
+                "host_identity_verified", "host_is_superhost",  "host_listings_count", "host_total_listings_count" , "instant_bookable", 
+                "is_location_exact", "maximum_nights", "minimum_nights")
+
+train.1k=train[train.indicies, selected.cols]
+
+for(col in c("accommodates", "availability_30","availability_365","availability_60","availability_90", "host_listings_count", "host_total_listings_count", "maximum_nights", "minimum_nights")){
+  train.1k[, col]=as.numeric(train.1k[, col])
+}
+
+train.1k=data.frame(train.1k)
+cols=c("bathrooms", "bed_type" , "bedrooms","beds", "cancellation_policy","city", "guests_included", "host_has_profile_pic",   
+                "host_identity_verified", "host_is_superhost",  "instant_bookable", 
+                "is_location_exact")
+train.1k.final=train.1k
+train.1k.final[cols] <- lapply(train.1k[cols], factor)
+
+
+##---------------------------------------------------
+## training phase, feature elimination, model fitting
+##---------------------------------------------------
+
+col.to.be.removed=c(2, 8, 10)
+y.1k.booking.rates = y.booking.rates[train.indicies]
+a.dataframe = last.14.var.table.dataframe[train.indicies, ]
+
+this.cols = colnames(last.14.var.table.dataframe)[c(2:6, 8:10)]
+
+a.dataframe[this.cols] <- lapply(a.dataframe[this.cols], factor)
+a.dataframe.2=a.dataframe[, -col.to.be.removed]
+
+
+
+
+
+
+##---------------------------------------------------
+## training phase, feature elimination, model fitting
+##---------------------------------------------------
+
+train.final=cbind(train.1k.final, a.dataframe.2)
+
+x=train.final
+y=y.booking.rates[train.indicies]
+
+
+na.row.indicies=c()
+for(i in 1:nrow(x)){if(length(which(is.na(x[i,])))>0){na.row.indicies=c(na.row.indicies, i)}}
+
+if(length(na.row.indicies)>0){
+  x=x[-na.row.indicies, ]
+  y=y[-na.row.indicies]
+}
+
+x=x[, -c(which(colnames(x)=="city"))] #  |  colnames(x) == "bedrooms"))]
+
+
+
+
+
+##---------------------------------------------------
+## training phase, feature elimination, model fitting, add new amenities
+##---------------------------------------------------
+
+x=cbind(train.final, all.amenities.matrix[train.indicies,])
+
+y=y.booking.rates[train.indicies]
+
+
+na.row.indicies=c()
+for(i in 1:nrow(x)){if(length(which(is.na(x[i,])))>0){na.row.indicies=c(na.row.indicies, i)}}
+
+if(length(na.row.indicies)>0){
+  x=x[-na.row.indicies, ]
+  y=y[-na.row.indicies]
+}
+
+x=x[, -c(which(colnames(x)=="city"))] #  |  colnames(x) == "bedrooms"))]
+
+
+
+
+
+##---------------------------------------------------
+## feature elimination
+##---------------------------------------------------
+
+y=as.factor(y)
+
+control <- rfeControl(functions=rfFuncs, method="cv", number=10)
+	# run the RFE algorithm
+	results <- rfe(x, y, sizes=c(1:20), rfeControl=control)
+	# summarize the results
+	#print(results)
+	# list the chosen features
+	predictors(results)
+	# plot the results
+	plot(results, type=c("g", "o"))
+
+
+#	results <- rfe(x[1:5000,], y[1:5000], sizes=c(1:20), rfeControl=control)
+
+
+	chosen.vars = predictors(results)[which(as.numeric(varImp(results)>3)==1)]
+	
+	
+	
+	
+	
+	
+
+##---------------------------------------------------
+## training phase, feature elimination, model fitting
+##---------------------------------------------------
+
+chosen.vars =  predictors(results) # setdiff(predictors(results), "bedrooms")
+
+x.train=x.train[, chosen.vars]
+
+lg.model = glm(y.train ~ ., family = binomial(link = "logit"), data = x.train)
+
+
+the.formula <- as.formula(paste("y.train ~", paste(colnames(x.train), collapse = " + ")))
+lg.model = randomForest(the.formula , data = x.train, ntree = 500, norm.votes = FALSE, replace=FALSE)  ## which is actually 
+
+
+lg.model = knn3(x.train, as.factor(y.train), k=5)
+
+
+
+
+
+
+
+##---------------------------------------------------
+## training phase, feature elimination, model fitting
+##---------------------------------------------------
+
+x=x[, chosen.vars]
+
+test.set=x
+test.label=y
+
+x.test = x
+y.test = y
+
+
+
+x.new.table=read.table("clean_19_new1.csv")
+
+y.new = y.booking.rates[x.new.table$id+1]
+
+
+
+
+
+## 
+
+x.new.table.save = x.new.table
+
+x.new.table.amenities = all.amenities.matrix[x.new.table$id+1,]
+x.new.table.2=cbind(x.new.table.save, x.new.table.amenities)
+
+write.table(x.new.table.2, file="d:/research/Collaborations/Xinyi/clean_table_new_dummy.txt", quote=FALSE, col.names = TRUE, row.names=FALSE)
+
+
+colnames(x.new.table.2)[(ncol(x.new.table.2)-42):(ncol(x.new.table.2))] = all.amenities.variables
+
+
+write.table(cbind(x.new.table.2, y.new), file="d:/research/Collaborations/Xinyi/clean_table_new_dummy_v2.txt", quote=FALSE, col.names = TRUE, row.names=FALSE)
+
+
+
+
+x.new.table=x.new.table.2[, c('id', intersect(colnames(x.new.table.2), chosen.vars))]
+
+
+x.test = x.new.table[6000:9000, 2:ncol(x.new.table)]
+y.test = y.new[6000:9000]
+
+
+
+
+
+
+
+
+# trial 1 : train on entire data set
+lg.model=glm(y.new ~ ., family = binomial(link = "logit"), data=x.new.table[, 2:ncol(x.new.table)])
+
+# trial 2 : train on half data set and test on rest half
+lg.model=glm(y.new[1:5000] ~ ., family = binomial(link = "logit"), data=x.new.table[1:5000, 2:ncol(x.new.table)])
+
+lg.model=glm(y.new[1:5000] ~ ., family = binomial(link = "logit"), data=x.new.table[1:5000, 2:ncol(x.new.table)])
+
+y.5k=y.new[1:5000]
+
+the.formula <- as.formula(paste("y.5k ~", paste(colnames(x.new.table[1:5000, 2:ncol(x.new.table)]), collapse = " + ")))
+
+
+train.samples=cbind(x.new.table[1:5000, 2:ncol(x.new.table)], y.5k)
+
+fit3 = randomForest(train.samples$y.5k ~., data = train.samples)
+
+
+# trial 2 : train on half data set and test on rest half
+y.train = as.factor(y.new[1:5000])
+lg.model=glm(y.train ~ ., family = binomial(link = "logit"), data=x.new.table[1:5000, 2:ncol(x.new.table)])
+
+
+
+
+
+##---------------------------------------------------
+## training phase, feature elimination, model fitting
+##---------------------------------------------------
+
+x = x.train
+y = y.train
+
+x.t = x.test
+y.t = y.test
+
+
+the.formula <- as.formula(paste("y.p ~", paste(colnames(x.p)[pids], collapse = " + ")))
+rfmodel=randomForest(the.formula, data = x.p[,pids], ntree = 500, norm.votes = FALSE, replace=FALSE)  ## which is actually results$fit
+
+	
+model=rfmodel
+		
+pred <- predict(model, x.t)
+test=table(observed = y.t, predicted = pred)
+test.accuracy=sum(diag(test))/sum(test)
+test.accuracy
+
+
+		
+		nnetFit <- caret::train(x, y,
+                 method = "nnet",
+                 preProcess = "range", 
+                 tuneLength = 2,
+                 trace = FALSE,
+                 maxit = 100)				
+		importance <- varImp(nnetFit, scale=FALSE)
+		print(importance)
+		plot(importance)
+
+		
+model=nnetFit
+pred <- predict(model, x.t)
+test=table(observed = y.t, predicted = pred)
+test.accuracy=sum(diag(test))/sum(test)
+test.accuracy
+		
+	
+		
+		knnFit1 <- caret::train(x, y,
+                 method = "knn",
+                 preProcess = c("center", "scale"),
+                 tuneLength = 10,
+                 trControl = trainControl(method="repeatedcv", number=10, repeats=3)) ##method = "cv"))
+		importance <- varImp(knnFit1, scale=FALSE)
+		print(importance)
+		plot(importance)
+				  
+	
+	
+model=knnFit1
+pred <- predict(model, x.t)
+test=table(observed = y.t, predicted = pred)
+test.accuracy=sum(diag(test))/sum(test)
+test.accuracy
+		
+		
+	
+		control <- rfeControl(functions=rfFuncs, method="cv", number=10)
+		caretFuncs$summary <- twoClassSummary
+		trainctrl <- trainControl(classProbs= TRUE,
+                           summaryFunction = twoClassSummary)
+		rf.profileROC.Radial <- rfe(x, y, 
+                             sizes=c(2:6),
+                             rfeControl=control,
+                             metric = "ROC",
+                             trControl = trainctrl)	
+	
+		
+		## lvq
+		set.seed(7)
+		# load the library
+		library(mlbench)
+		library(caret)
+		# load the dataset
+		# prepare training scheme
+		control <- trainControl(method="repeatedcv", number=10, repeats=3)
+		# train the model
+		my.data=data.frame(x,y)
+		lvqmodel <- caret::train(y~., data=my.data, method="lvq", preProcess="scale", trControl=control)
+		# estimate variable importance
+		importance <- varImp(model, scale=FALSE)
+		# summarize importance
+		print(importance)
+	
+	
+model=lvqmodel
+pred <- predict(model, x.t)
+test=table(observed = y.t, predicted = pred)
+test.accuracy=sum(diag(test))/sum(test)
+test.accuracy
+	
+	
+	## support vector machine
+	
+		dat=cbind(x,y)
+		colnames(dat)[ncol(dat)]="cls"
+		
+		wts<-100/table(dat$cls)
+		fit = svm(cls ~ ., data=dat, class.weights=wts)
+
+model=fit
+pred <- predict(model, x.t)
+test=table(observed = y.t, predicted = pred)
+test.accuracy=sum(diag(test))/sum(test)
+test.accuracy	
+	
+	
+	
+		### lda
+	library(MASS)
+	ldamodel=lda(x,y)
+	pred=predict(ldamodel,x.t)
+	test=table(observed = y.t, predicted = pred)
+	test.accuracy=sum(diag(test))/sum(test)
+	test.accuracy
+	
+
+	ldamodel=lda(x,y)
+	pred=predict(ldamodel,x.t)$class
+	print(table(pred,y.t))	
+	test=table(pred,y.t)
+	test.accuracy=sum(diag(test))/sum(test)
+	test.accuracy
+	
+	
+	### generate ROCR curve
+	
+model.names=c("rfmodel","nnetFit","knnFit1","lvqmodel","ldamodel","fit")
+assign("nnetFit", nnetFit)
+assign("knnFit1", knnFit1)
+assign("lvqmodel", lvqmodel)
+assign("ldamodel", ldamodel)
+assign("fit", fit)
+assign("rfmodel", rfmodel)
+
+
+
+
+
+
+
+
+
+##---------------------------------------------------
+## evaluation phase, evaluate tpr, fpr, auc accuracy
+##---------------------------------------------------
+
+library(ROCR)
+p <- predict(lg.model, newdata=x.test, type="response")
+#p <- predict(lg.model, newdata=x.test, type="prob")
+
+
+pr <- ROCR::prediction(p, y.test)
+prf <- ROCR::performance(pr, measure = "tpr", x.measure = "fpr")
+plot(prf)
+
+auc <- ROCR::performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+
+
+
+```
+
+
+
+
